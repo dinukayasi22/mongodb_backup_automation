@@ -1,0 +1,33 @@
+name: Daily MongoDB Backup to R2
+
+on:
+  schedule:
+    # Runs at 2:00 AM UTC every day
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allows you to trigger the backup manually
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download mongodump
+        run: |
+          curl -O https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-100.9.4.tgz
+          tar -zxvf mongodb-database-tools-ubuntu2204-x86_64-100.9.4.tgz
+          sudo cp mongodb-database-tools-ubuntu2204-x86_64-100.9.4/bin/mongodump /usr/local/bin/
+
+      - name: Create Compressed Backup
+        run: |
+          TIMESTAMP=$(date +'%Y-%m-%d-%H%M')
+          mongodump --uri="${{ secrets.MONGO_URI }}" --archive="backup-${TIMESTAMP}.gz" --gzip
+          echo "BACKUP_FILE=backup-${TIMESTAMP}.gz" >> $GITHUB_ENV
+
+      - name: Upload to Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
+        run: |
+          # The Ubuntu runner comes with the AWS CLI pre-installed
+          aws s3 cp ${{ env.BACKUP_FILE }} s3://${{ secrets.S3_BUCKET }}/${{ env.BACKUP_FILE }} \
+            --endpoint-url ${{ secrets.S3_ENDPOINT }} \
+            --region auto
