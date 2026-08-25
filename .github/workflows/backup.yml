@@ -2,6 +2,17 @@ name: Multi-Cluster MongoDB Backup to R2
 
 on:
   workflow_dispatch:
+    inputs:
+      target_env:
+        description: 'Select Environment to Backup'
+        required: true
+        default: 'All'
+        type: choice
+        options:
+          - 'All'
+          - 'Live'
+          - 'QA'
+          - 'Local'
 
 jobs:
   backup-all:
@@ -20,36 +31,44 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
           S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          SELECTED_ENV: ${{ github.event.inputs.target_env || 'All' }}
         run: |
           TIMESTAMP=$(date +'%Y-%m-%d-%H%M')
           GLOBAL_LOG="backup-run-${TIMESTAMP}.log"
           
-          # Initialize Global Log File
           echo "==================================================" >> "$GLOBAL_LOG"
           echo "MongoDB Backup Run - Started at: $(date -u)" >> "$GLOBAL_LOG"
+          echo "Target Environment: ${SELECTED_ENV}" >> "$GLOBAL_LOG"
           echo "==================================================" >> "$GLOBAL_LOG"
 
-          # Validate JSON configuration
+          # Validate JSON
           if ! echo "$CLUSTERS_CONFIG" | jq empty > /dev/null 2>&1; then
             echo "::error::CLUSTERS_CONFIG is not valid JSON."
             echo "ERROR: Invalid JSON in CLUSTERS_CONFIG." >> "$GLOBAL_LOG"
             exit 1
           fi
 
-          # Initialize Job Summary Markdown Table for GitHub Actions UI
           echo "## MongoDB Backup Summary (${TIMESTAMP})" >> $GITHUB_STEP_SUMMARY
-          echo "| Cluster Name | Status | Details |" >> $GITHUB_STEP_SUMMARY
-          echo "| :--- | :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+          echo "Target Scope: **${SELECTED_ENV}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | Cluster Name | Status | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- | :--- | :--- |" >> $GITHUB_STEP_SUMMARY
 
-          # Process clusters sequentially
+          # Iterate over clusters
           echo "$CLUSTERS_CONFIG" | jq -c '.[]' | while read -r cluster; do
             NAME=$(echo "$cluster" | jq -r '.name // empty')
             URI=$(echo "$cluster" | jq -r '.uri // empty')
+            ENV=$(echo "$cluster" | jq -r '.env // "General"')
+
+            # Filter by selected environment if not 'All'
+            if [ "$SELECTED_ENV" != "All" ] && [ "$ENV" != "$SELECTED_ENV" ]; then
+              continue
+            fi
 
             if [ -z "$NAME" ] || [ -z "$URI" ]; then
-              echo "::warning::Skipping malformed cluster entry (missing name or uri)."
-              echo "| Unknown | SKIPPED | Missing 'name' or 'uri' in JSON |" >> $GITHUB_STEP_SUMMARY
-              echo "[$(date -u +%T)] SKIPPED: Missing name or uri in config." >> "$GLOBAL_LOG"
+              echo "::warning::Skipping malformed cluster entry."
+              echo "| ${ENV} | Unknown | SKIPPED | Missing 'name' or 'uri' |" >> $GITHUB_STEP_SUMMARY
+              echo "[$(date -u +%T)] SKIPPED: Missing name or uri." >> "$GLOBAL_LOG"
               continue
             fi
 
@@ -58,34 +77,31 @@ jobs:
             DUMP_TEMP_LOG="dump_raw.log"
             UPLOAD_TEMP_LOG="upload_raw.log"
 
-            echo "Starting backup for: ${NAME} at $(date -u)" > "$CLUSTER_LOG"
+            echo "Starting backup for: [${ENV}] ${NAME} at $(date -u)" > "$CLUSTER_LOG"
 
-            # Step 1: Run mongodump
+            # Step 1: Dump database
             if mongodump --uri="$URI" --archive="$FILE_NAME" --gzip > "$DUMP_TEMP_LOG" 2>&1; then
               cat "$DUMP_TEMP_LOG" >> "$CLUSTER_LOG"
               echo "mongodump completed successfully." >> "$CLUSTER_LOG"
 
-              # Step 2: Upload backup archive to Cloudflare R2
-              if aws s3 cp "$FILE_NAME" "s3://${S3_BUCKET}/${NAME}/${FILE_NAME}" \
+              # Step 2: Upload to Cloudflare R2 under Environment directory
+              if aws s3 cp "$FILE_NAME" "s3://${S3_BUCKET}/${ENV}/${NAME}/${FILE_NAME}" \
                   --endpoint-url "$S3_ENDPOINT" \
                   --region auto > "$UPLOAD_TEMP_LOG" 2>&1; then
                 
                 cat "$UPLOAD_TEMP_LOG" >> "$CLUSTER_LOG"
                 echo "Archive successfully uploaded to R2." >> "$CLUSTER_LOG"
-
-                echo "| **${NAME}** | SUCCESS | Backup and R2 upload complete |" >> $GITHUB_STEP_SUMMARY
-                echo "[$(date -u +%T)] SUCCESS: ${NAME} (Archive: ${FILE_NAME})" >> "$GLOBAL_LOG"
+                echo "| **${ENV}** | **${NAME}** | SUCCESS | Backup and R2 upload complete |" >> $GITHUB_STEP_SUMMARY
+                echo "[$(date -u +%T)] SUCCESS: [${ENV}] ${NAME}" >> "$GLOBAL_LOG"
               else
                 UPLOAD_ERR=$(cat "$UPLOAD_TEMP_LOG" | tr '\n' ' ' | head -c 200)
                 echo "Upload Error: ${UPLOAD_ERR}" >> "$CLUSTER_LOG"
                 echo "::error::R2 Upload failed for ${NAME}: ${UPLOAD_ERR}"
-                echo "| **${NAME}** | FAILED | **R2 Upload Error**: \`${UPLOAD_ERR}\` |" >> $GITHUB_STEP_SUMMARY
-                echo "[$(date -u +%T)] FAILED (Upload): ${NAME} - ${UPLOAD_ERR}" >> "$GLOBAL_LOG"
+                echo "| **${ENV}** | **${NAME}** | FAILED | **R2 Upload Error**: \`${UPLOAD_ERR}\` |" >> $GITHUB_STEP_SUMMARY
+                echo "[$(date -u +%T)] FAILED (Upload): [${ENV}] ${NAME} - ${UPLOAD_ERR}" >> "$GLOBAL_LOG"
               fi
             else
               cat "$DUMP_TEMP_LOG" >> "$CLUSTER_LOG"
-              
-              # Diagnose common dump issues
               DUMP_ERR_FULL=$(cat "$DUMP_TEMP_LOG")
               DUMP_ERR_SUMMARY="Unknown connection error"
 
@@ -100,23 +116,22 @@ jobs:
               fi
 
               echo "::error::mongodump failed for ${NAME} -> ${DUMP_ERR_SUMMARY}"
-              echo "| **${NAME}** | FAILED | **Dump Error**: ${DUMP_ERR_SUMMARY} |" >> $GITHUB_STEP_SUMMARY
-              echo "[$(date -u +%T)] FAILED (Dump): ${NAME} - ${DUMP_ERR_SUMMARY}" >> "$GLOBAL_LOG"
+              echo "| **${ENV}** | **${NAME}** | FAILED | **Dump Error**: ${DUMP_ERR_SUMMARY} |" >> $GITHUB_STEP_SUMMARY
+              echo "[$(date -u +%T)] FAILED (Dump): [${ENV}] ${NAME} - ${DUMP_ERR_SUMMARY}" >> "$GLOBAL_LOG"
             fi
 
-            # Step 3: Always upload the individual cluster log to R2
-            aws s3 cp "$CLUSTER_LOG" "s3://${S3_BUCKET}/${NAME}/${CLUSTER_LOG}" \
+            # Step 3: Upload cluster log into its environment directory
+            aws s3 cp "$CLUSTER_LOG" "s3://${S3_BUCKET}/${ENV}/${NAME}/${CLUSTER_LOG}" \
               --endpoint-url "$S3_ENDPOINT" \
               --region auto > /dev/null 2>&1
 
-            # Clean up local temporary files
             rm -f "$FILE_NAME" "$CLUSTER_LOG" "$DUMP_TEMP_LOG" "$UPLOAD_TEMP_LOG"
           done
 
-          # Finalize & Upload Global Log
           echo "==================================================" >> "$GLOBAL_LOG"
           echo "Run finished at: $(date -u)" >> "$GLOBAL_LOG"
 
+          # Upload global log to _logs directory
           aws s3 cp "$GLOBAL_LOG" "s3://${S3_BUCKET}/_logs/${GLOBAL_LOG}" \
             --endpoint-url "$S3_ENDPOINT" \
             --region auto > /dev/null 2>&1
