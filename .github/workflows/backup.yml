@@ -1,7 +1,7 @@
-name: Manual Multi-Cluster MongoDB Backup to R2
+name: Resilient Multi-Cluster MongoDB Backup to R2
 
 on:
-  workflow_dispatch: # Trigger the backup manually via the GitHub UI
+  workflow_dispatch:
 
 jobs:
   backup-all:
@@ -22,26 +22,85 @@ jobs:
           S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
         run: |
           TIMESTAMP=$(date +'%Y-%m-%d-%H%M')
+          
+          # Validate JSON configuration
+          if ! echo "$CLUSTERS_CONFIG" | jq empty > /dev/null 2>&1; then
+            echo "::error::CLUSTERS_CONFIG is not valid JSON. Please check your GitHub Secret format."
+            exit 1
+          fi
 
-          # Iterate over each cluster entry in the JSON array
+          TOTAL_CLUSTERS=$(echo "$CLUSTERS_CONFIG" | jq '. | length')
+          echo "Found ${TOTAL_CLUSTERS} clusters to backup."
+
+          # Initialize Job Summary Markdown Table
+          echo "## MongoDB Backup Summary (${TIMESTAMP})" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster Name | Status | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+
+          FAILED_COUNT=0
+          SUCCESS_COUNT=0
+
+          # Process clusters sequentially
           echo "$CLUSTERS_CONFIG" | jq -c '.[]' | while read -r cluster; do
-            NAME=$(echo "$cluster" | jq -r '.name')
-            URI=$(echo "$cluster" | jq -r '.uri')
+            NAME=$(echo "$cluster" | jq -r '.name // empty')
+            URI=$(echo "$cluster" | jq -r '.uri // empty')
+
+            if [ -z "$NAME" ] || [ -z "$URI" ]; then
+              echo "::warning::Skipping malformed cluster entry (missing name or uri)."
+              echo "| Unknown | SKIPPED | Missing 'name' or 'uri' in JSON config |" >> $GITHUB_STEP_SUMMARY
+              continue
+            fi
+
             FILE_NAME="${NAME}-backup-${TIMESTAMP}.gz"
+            DUMP_LOG="dump-${NAME}.log"
+            UPLOAD_LOG="upload-${NAME}.log"
 
             echo "=========================================="
-            echo "Starting backup for: ${NAME}"
+            echo "Processing: ${NAME}"
             echo "=========================================="
 
-            # Create the archive
-            mongodump --uri="$URI" --archive="$FILE_NAME" --gzip
+            # Step 1: Run mongodump and capture output
+            if mongodump --uri="$URI" --archive="$FILE_NAME" --gzip > "$DUMP_LOG" 2>&1; then
+              echo "mongodump succeeded for ${NAME}."
 
-            # Upload to Cloudflare R2 into a cluster-specific folder
-            aws s3 cp "$FILE_NAME" "s3://${S3_BUCKET}/${NAME}/${FILE_NAME}" \
-              --endpoint-url "$S3_ENDPOINT" \
-              --region auto
+              # Step 2: Upload to Cloudflare R2
+              if aws s3 cp "$FILE_NAME" "s3://${S3_BUCKET}/${NAME}/${FILE_NAME}" \
+                  --endpoint-url "$S3_ENDPOINT" \
+                  --region auto > "$UPLOAD_LOG" 2>&1; then
+                
+                echo "Upload succeeded for ${NAME}."
+                echo "| **${NAME}** | SUCCESS | Backup and R2 upload complete |" >> $GITHUB_STEP_SUMMARY
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              else
+                UPLOAD_ERR=$(cat "$UPLOAD_LOG" | tr '\n' ' ' | head -c 200)
+                echo "::error::R2 Upload failed for ${NAME}: ${UPLOAD_ERR}"
+                echo "| **${NAME}** | FAILED | **R2 Upload Error**: \`${UPLOAD_ERR}\` |" >> $GITHUB_STEP_SUMMARY
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+              fi
+            else
+              # Diagnose common mongodump failure reasons
+              DUMP_ERR_FULL=$(cat "$DUMP_LOG")
+              DUMP_ERR_SUMMARY="Unknown connection error"
 
-            # Remove the local archive to save disk space on the runner
-            rm -f "$FILE_NAME"
-            echo "Completed and uploaded ${NAME} backup successfully."
+              if echo "$DUMP_ERR_FULL" | grep -qiE "server selection timeout|tls: internal error|no reachable servers"; then
+                DUMP_ERR_SUMMARY="IP Expired / Blocked or Host Unreachable"
+              elif echo "$DUMP_ERR_FULL" | grep -qiE "Authentication failed|bad auth"; then
+                DUMP_ERR_SUMMARY="Invalid Username or Password"
+              elif echo "$DUMP_ERR_FULL" | grep -qiE "Unauthorized|not authorized"; then
+                DUMP_ERR_SUMMARY="User lacks backup/read permissions"
+              else
+                DUMP_ERR_SUMMARY=$(echo "$DUMP_ERR_FULL" | tail -n 2 | tr '\n' ' ' | head -c 180)
+              fi
+
+              echo "::error::mongodump failed for ${NAME} -> ${DUMP_ERR_SUMMARY}"
+              echo "| **${NAME}** | FAILED | **Dump Error**: ${DUMP_ERR_SUMMARY} |" >> $GITHUB_STEP_SUMMARY
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+            fi
+
+            # Clean up local disk artifacts
+            rm -f "$FILE_NAME" "$DUMP_LOG" "$UPLOAD_LOG"
           done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "Pipeline finished processing all clusters."
